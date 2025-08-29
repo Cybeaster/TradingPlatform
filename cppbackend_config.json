@@ -1,0 +1,10 @@
+{
+  "name": "cppbackend",
+  "version-string": "0.1.0",
+  "builtin-baseline": "d8f89df9f3f72d3a2641d3b3e51d0ad2f3b3f8ad",
+  "dependencies": [
+    "drogon",
+    "libpqxx",
+    "nlohmann-json"
+  ]
+}
