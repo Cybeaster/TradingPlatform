@@ -1,14 +1,15 @@
 #define NOMINMAX
 
 #include <algorithm>
+#include <csignal>
 #include <cstdlib>
 #include <drogon/drogon.h>
 #include <drogon/orm/DbClient.h>
-#include <functional>  // std::function
-#include <iostream>    // std::cerr
-#include <json/json.h> // Json::Value for drogon::newHttpJsonResponse
+#include <functional>
+#include <iostream>
+#include <json/json.h>
 #include <string>
-#include <thread> // std::thread::hardware_concurrency
+#include <thread>
 
 using json = Json::Value;
 using drogon::HttpRequestPtr;
@@ -23,66 +24,62 @@ respondJson(const std::function<void(const HttpResponsePtr &)> &callback,
   callback(resp);
 }
 
-int main(int argc, char *argv[]) {
+// Глобальная строка подключения (заполним в main)
+static std::string g_connStr;
+
+// Ленивый DbClient: создаётся при первом обращении (пул = 1, меньше churn'a)
+static drogon::orm::DbClientPtr getDb() {
+  static auto db = drogon::orm::DbClient::newPgClient(g_connStr, 1);
+  return db;
+}
+
+// Кроссплатформенный аккуратный выход
+static void onSignal(int) { drogon::app().quit(); }
+
+int main(int, char **) {
+  std::signal(SIGINT, onSignal);
+  std::signal(SIGTERM, onSignal);
+
   try {
-    // Порт
-    if (const char *portEnv = std::getenv("PORT")) {
-      try {
-        uint16_t port = 8080;
-        int v = std::stoi(portEnv);
-        if (v >= 0 && v <= 65535)
-          port = static_cast<uint16_t>(v);
-      } catch (...) {
-      } // дефолт 8080
-    }
-
-    // Строка подключения к Postgres (poolsize = кол-ву потоков)
     const char *dbEnv = std::getenv("DATABASE_URL");
-    std::string connStr = dbEnv
-                              ? std::string(dbEnv)
-                              : "postgresql://postgres:postgres@localhost:5432/"
-                                "trading?sslmode=disable";
+    // Добавили connect_timeout=2 — чтобы не крутить длинные зависшие коннекты
+    g_connStr = std::string(dbEnv);
 
-    // Создаем пул соединений к БД (thread-safe)
-    const unsigned threads = std::max(1u, std::thread::hardware_concurrency());
-    auto db = drogon::orm::DbClient::newPgClient(connStr, threads);
-
-    // --------- /health (GET) ----------
+    // ---------- /health (GET) ----------
+    // Делает лёгкий запрос к БД, но если БД мертва — просто ставим degraded.
     drogon::app().registerHandler(
         "/health",
-        [db](const HttpRequestPtr &,
-             std::function<void(const HttpResponsePtr &)> &&callback) {
+        [](const HttpRequestPtr &,
+           std::function<void(const HttpResponsePtr &)> &&cb) {
+          auto db = getDb();
           db->execSqlAsync(
               "SELECT 1",
-              // success
-              [callback](const drogon::orm::Result &) {
+              [cb](const drogon::orm::Result &) {
                 json body;
                 body["status"] = "ok";
                 body["db"] = "ok";
-                respondJson(callback, drogon::k200OK, body);
+                respondJson(cb, drogon::k200OK, body);
               },
-              // error
-              [callback](const drogon::orm::DrogonDbException &e) {
+              [cb](const drogon::orm::DrogonDbException &e) {
                 json body;
                 body["status"] = "degraded";
                 body["db"] = "error";
                 body["error"] = e.base().what();
-                respondJson(callback, drogon::k503ServiceUnavailable, body);
+                respondJson(cb, drogon::k503ServiceUnavailable, body);
               });
         },
         {drogon::Get});
 
-    // --------- /orders (POST) : create ----------
+    // ---------- /orders (POST) ----------
     drogon::app().registerHandler(
         "/orders",
-        [db](const HttpRequestPtr &req,
-             std::function<void(const HttpResponsePtr &)> &&callback) {
-          // Parse JSON using Drogon/JsonCpp
+        [](const HttpRequestPtr &req,
+           std::function<void(const HttpResponsePtr &)> &&cb) {
           const auto jsonPtr = req->getJsonObject();
           if (!jsonPtr) {
             Json::Value err(Json::objectValue);
             err["error"] = "Invalid JSON body";
-            respondJson(callback, drogon::k400BadRequest, err);
+            respondJson(cb, drogon::k400BadRequest, err);
             return;
           }
           const Json::Value &body = *jsonPtr;
@@ -109,21 +106,21 @@ int main(int argc, char *argv[]) {
             Json::Value err(Json::objectValue);
             err["error"] = "Invalid order: symbol, side(BUY/SELL), quantity>0, "
                            "price>0 required";
-            respondJson(callback, drogon::k400BadRequest, err);
+            respondJson(cb, drogon::k400BadRequest, err);
             return;
           }
 
+          auto db = getDb();
           db->execSqlAsync(
               "INSERT INTO orders(symbol, side, quantity, price, status) "
               "VALUES ($1,$2,$3,$4,'NEW') RETURNING id, created_at",
-              // success (callbacks first)
-              [callback, symbol, side, quantity,
+              [cb, symbol, side, quantity,
                price](const drogon::orm::Result &r) {
                 if (r.empty()) {
                   Json::Value error(Json::objectValue);
                   error["error"] = "error";
                   error["detail"] = "Failed to create order";
-                  respondJson(callback, drogon::k500InternalServerError, error);
+                  respondJson(cb, drogon::k500InternalServerError, error);
                   return;
                 }
                 const auto id = r[0]["id"].as<long long>();
@@ -141,24 +138,23 @@ int main(int argc, char *argv[]) {
                 auto resp = drogon::HttpResponse::newHttpJsonResponse(obj);
                 resp->setStatusCode(drogon::k201Created);
                 resp->addHeader("Location", "/orders/" + std::to_string(id));
-                callback(resp);
+                cb(resp);
               },
-              // error
-              [callback](const drogon::orm::DrogonDbException &e) {
+              [cb](const drogon::orm::DrogonDbException &e) {
                 Json::Value error(Json::objectValue);
                 error["error"] = "Unexpected error";
                 error["detail"] = e.base().what();
-                respondJson(callback, drogon::k500InternalServerError, error);
+                respondJson(cb, drogon::k500InternalServerError, error);
               },
-              // params (after callbacks)
               symbol, side, quantity, price);
         },
         {drogon::Post});
-    // ... existing code ...
+
+    // ---------- /orders (GET) ----------
     drogon::app().registerHandler(
         "/orders",
-        [db](const HttpRequestPtr &req,
-             std::function<void(const HttpResponsePtr &)> &&callback) {
+        [](const HttpRequestPtr &req,
+           std::function<void(const HttpResponsePtr &)> &&cb) {
           int limit = 50;
           if (auto v = req->getParameter("limit"); !v.empty()) {
             try {
@@ -166,12 +162,11 @@ int main(int argc, char *argv[]) {
             } catch (...) {
             }
           }
-
+          auto db = getDb();
           db->execSqlAsync(
               "SELECT id, symbol, side, quantity, price, status, created_at "
-              "FROM orders ORDER BY id DESC LIMIT $1",
-              // success
-              [callback](const drogon::orm::Result &r) {
+              "FROM orders ORDER BY id DESC LIMIT $1::INT4",
+              [cb](const drogon::orm::Result &r) {
                 Json::Value arr(Json::arrayValue);
                 for (const auto &row : r) {
                   Json::Value item(Json::objectValue);
@@ -185,65 +180,60 @@ int main(int argc, char *argv[]) {
                   item["created_at"] = std::string(row["created_at"].c_str());
                   arr.append(item);
                 }
-                respondJson(callback, drogon::k200OK, arr);
+                respondJson(cb, drogon::k200OK, arr);
               },
-              // error
-              [callback](const drogon::orm::DrogonDbException &e) {
+              [cb](const drogon::orm::DrogonDbException &e) {
                 Json::Value body(Json::objectValue);
                 body["error"] = "Unexpected error";
                 body["detail"] = e.base().what();
-                respondJson(callback, drogon::k500InternalServerError, body);
+                respondJson(cb, drogon::k500InternalServerError, body);
               },
-              // params
               limit);
         },
         {drogon::Get});
-    // ... existing code ...
+
+    // ---------- /orders/{id} (DELETE) ----------
     drogon::app().registerHandler(
         "/orders/{1}",
-        [db](const HttpRequestPtr &req,
-             std::function<void(const HttpResponsePtr &)> &&callback) {
-          long long id = 0;
-          try {
-            id = std::stoll(req->getParameter("1"));
-          } catch (...) {
-            Json::Value err(Json::objectValue);
-            err["error"] = "Invalid id";
-            respondJson(callback, drogon::k400BadRequest, err);
+        [](const HttpRequestPtr &req,
+           std::function<void(const HttpResponsePtr &)> &&cb, long long id) {
+          if (id <= 0) {
+            respondJson(cb, drogon::k400BadRequest,
+                        Json::Value{{"error", "Invalid id"}});
             return;
           }
-
-          // Используем RETURNING, чтобы понять, была ли запись
+          auto db = getDb();
           db->execSqlAsync(
               "DELETE FROM orders WHERE id = $1 RETURNING id",
-              // success
-              [callback](const drogon::orm::Result &r) {
+              [cb](const drogon::orm::Result &r) {
                 if (r.empty()) {
                   Json::Value obj(Json::objectValue);
                   obj["error"] = "Order not found";
-                  respondJson(callback, drogon::k404NotFound, obj);
+                  respondJson(cb, drogon::k404NotFound, obj);
                   return;
                 }
                 Json::Value body(Json::objectValue);
                 body["status"] = "deleted";
                 body["id"] =
                     static_cast<Json::Int64>(r[0]["id"].as<long long>());
-                respondJson(callback, drogon::k200OK, body);
+                respondJson(cb, drogon::k200OK, body);
               },
-              // error
-              [callback](const drogon::orm::DrogonDbException &e) {
+              [cb](const drogon::orm::DrogonDbException &e) {
                 Json::Value body(Json::objectValue);
                 body["error"] = "Unexpected error";
                 body["detail"] = e.base().what();
-                respondJson(callback, drogon::k500InternalServerError, body);
+                respondJson(cb, drogon::k500InternalServerError, body);
               },
-              // params
               id);
         },
         {drogon::Delete});
+
   } catch (const std::exception &e) {
     std::cerr << "Exception: " << e.what() << std::endl;
     return 1;
   }
+
+  drogon::app().setLogLevel(trantor::Logger::kTrace);
+  drogon::app().addListener("127.0.0.1", 8080).run();
+  return 0;
 }
-// ... existing code ...
